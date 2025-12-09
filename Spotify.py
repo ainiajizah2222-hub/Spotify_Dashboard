@@ -4,6 +4,7 @@
 import os
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 import streamlit as st  # langsung import di atas, jangan di dalam main()
 
@@ -12,6 +13,16 @@ import streamlit as st  # langsung import di atas, jangan di dalam main()
 # -----------------------------
 DATA_PATH = "top_spotify_clustered.csv"      # ganti jika nama file kamu berbeda
 FEEDBACK_PATH = "feedback_playlist.csv"      # file untuk menyimpan feedback
+
+# Enam fitur audio yang digunakan di penelitian
+FEATURE_COLUMNS = [
+    "danceability",
+    "energy",
+    "valence",
+    "tempo",
+    "loudness",
+    "acousticness",
+]
 
 
 # -----------------------------
@@ -26,8 +37,12 @@ def load_data(path: str) -> pd.DataFrame:
     if "cluster" not in df.columns:
         raise ValueError("Dataset harus memiliki kolom 'cluster'.")
 
-    if "valence" not in df.columns:
-        raise ValueError("Dataset harus memiliki kolom 'valence' untuk pemetaan mood.")
+    # Pastikan enam fitur audio tersedia
+    missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Dataset harus memiliki kolom fitur audio berikut: {missing}"
+        )
 
     # Siapkan kolom link Spotify jika belum ada
     if "spotify_url" not in df.columns:
@@ -59,6 +74,84 @@ def get_cluster_mapping_by_valence(df: pd.DataFrame) -> dict:
     return {"happy": happy_cluster, "sad": sad_cluster}
 
 
+def prepare_cluster_profiles(df: pd.DataFrame):
+    """
+    Menyusun profil rata-rata fitur per klaster dan menormalkan ke skala 0–1
+    agar bisa dibandingkan dengan preferensi pengguna.
+    """
+    feature_min = df[FEATURE_COLUMNS].min()
+    feature_max = df[FEATURE_COLUMNS].max()
+    cluster_means = df.groupby("cluster")[FEATURE_COLUMNS].mean()
+
+    # Normalisasi per fitur ke 0–1
+    denom = (feature_max - feature_min).replace(0, 1e-9)
+    cluster_means_norm = (cluster_means - feature_min) / denom
+
+    return feature_min, feature_max, cluster_means_norm
+
+
+def mood_to_valence_pref(mood: str) -> float:
+    """Memetakan mood ke preferensi valence (0–1)."""
+    if mood == "Senang":
+        return 0.8
+    if mood == "Sedih":
+        return 0.2
+    return 0.5  # Netral
+
+
+def choose_cluster_by_preferences(pref_vector: dict, cluster_means_norm: pd.DataFrame) -> int:
+    """
+    Menentukan klaster yang paling dekat dengan preferensi pengguna
+    berdasarkan jarak Euclidean pada fitur yang sudah dinormalisasi.
+    """
+    user_vec = np.array([pref_vector[c] for c in FEATURE_COLUMNS])
+
+    best_cluster = None
+    best_dist = None
+    for cluster_label, row in cluster_means_norm.iterrows():
+        cluster_vec = row.to_numpy()
+        dist = np.linalg.norm(user_vec - cluster_vec)
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_cluster = int(cluster_label)
+
+    return best_cluster
+
+
+def build_playlist_from_subset(
+    subset: pd.DataFrame,
+    n_tracks: int,
+    fav_query: str | None = None,
+) -> pd.DataFrame:
+    """
+    Menyusun playlist dari subset lagu:
+    - Diacak dulu
+    - Jika ada judul/artis favorit, lagu yang match diprioritaskan muncul di urutan atas.
+    """
+    subset_shuffled = subset.sample(frac=1.0, random_state=None)
+
+    if fav_query:
+        fav = fav_query.strip().lower()
+        if fav:
+            title_series = subset_shuffled.get("track_name", pd.Series("", index=subset_shuffled.index)).astype(str)
+            artist_series = subset_shuffled.get("track_artist", pd.Series("", index=subset_shuffled.index)).astype(str)
+
+            mask = (
+                title_series.str.lower().str.contains(fav, na=False)
+                | artist_series.str.lower().str.contains(fav, na=False)
+            )
+
+            fav_df = subset_shuffled[mask]
+            other_df = subset_shuffled[~mask]
+
+            # Maksimal 3 lagu prioritas, lalu sisanya acak
+            playlist = pd.concat([fav_df.head(3), other_df]).head(n_tracks)
+            return playlist
+
+    # Jika tidak ada preferensi, atau tidak ada yang match
+    return subset_shuffled.head(n_tracks)
+
+
 def save_feedback(row: dict, feedback_path: str = FEEDBACK_PATH) -> None:
     """Menyimpan 1 baris feedback ke file CSV (append)."""
     df_row = pd.DataFrame([row])
@@ -78,6 +171,8 @@ def init_session_state():
         "chosen_clusters": None,
         "user_id": None,
         "mood": None,
+        "fav_query": "",
+        "feature_prefs": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -207,7 +302,7 @@ def main():
             "- Isi preferensi dan mood\n"
             "- Dapatkan playlist\n"
             "- Buka lagu di Spotify\n"
-            "- Berikan rating & komentar"
+            "- Berikan rating & komentar singkat"
         )
         st.markdown("---")
 
@@ -230,7 +325,7 @@ def main():
                 <div class="header-title">Personalisasi Playlist Musik Spotify</div>
                 <p class="header-subtitle">
                     Aplikasi uji coba untuk melihat bagaimana klasterisasi fitur audio
-                    dapat digunakan dalam rekomendasi playlist yang sesuai dengan mood pengguna.
+                    dapat digunakan dalam rekomendasi playlist yang sesuai dengan mood dan preferensi pengguna.
                 </p>
             </div>
         </div>
@@ -247,13 +342,16 @@ def main():
 
     init_session_state()
 
+    # Siapkan profil klaster untuk pemetaan preferensi -> klaster
+    _, _, cluster_means_norm = prepare_cluster_profiles(df)
+
     # Siapkan daftar negara (jika ada)
     if "country" in df.columns:
         country_options = ["Bebas"] + sorted(df["country"].dropna().unique().tolist())
     else:
         country_options = ["Bebas"]
 
-    # Pemetaan klaster happy/sad berdasar valence
+    # Pemetaan klaster happy/sad berdasar valence (untuk deskripsi saja)
     cluster_map = get_cluster_mapping_by_valence(df)
 
     # -------------------------
@@ -264,6 +362,7 @@ def main():
 
     with st.form("pref_form"):
         user_id = st.text_input("Nama / ID responden", "")
+
         mood = st.radio(
             "Mood kamu sekarang?",
             ["Senang", "Netral", "Sedih"],
@@ -286,6 +385,42 @@ def main():
                 country_options,
             )
 
+        st.markdown(
+            "#### Preferensi karakteristik lagu\n"
+            "<span class='small-caption'>1 = sangat tidak suka, 5 = sangat suka</span>",
+            unsafe_allow_html=True,
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            pref_dance = st.slider(
+                "Lagu yang enak untuk bergoyang / mudah diikuti ritmenya (danceability)",
+                1, 5, 3,
+            )
+            pref_energy = st.slider(
+                "Lagu yang terasa energik dan bersemangat (energy)",
+                1, 5, 3,
+            )
+            pref_tempo = st.slider(
+                "Lagu dengan tempo yang cenderung cepat (tempo)",
+                1, 5, 3,
+            )
+        with col_b:
+            pref_loudness = st.slider(
+                "Lagu dengan suara yang kuat/keras (loudness)",
+                1, 5, 3,
+            )
+            pref_acoustic = st.slider(
+                "Lagu bernuansa akustik / instrumen alami (acousticness)",
+                1, 5, 3,
+            )
+
+        fav_query = st.text_input(
+            "Opsional: judul lagu atau nama artis favorit",
+            "",
+            help="Jika tersedia di dataset, lagu/artis ini akan diutamakan muncul di urutan teratas playlist.",
+        )
+
         submitted_pref = st.form_submit_button("🎵 Buat Playlist")
 
     st.markdown("</div>", unsafe_allow_html=True)
@@ -295,13 +430,24 @@ def main():
         if not user_id.strip():
             st.warning("Mohon isi Nama / ID responden terlebih dahulu.")
         else:
-            # Tentukan klaster target berdasarkan mood
-            if mood == "Senang":
-                target_clusters = [cluster_map["happy"]]
-            elif mood == "Sedih":
-                target_clusters = [cluster_map["sad"]]
-            else:  # Netral
-                target_clusters = list(df["cluster"].unique())
+            # Bangun vektor preferensi fitur audio (skala 0–1)
+            scale_1_5 = lambda x: (x - 1) / 4.0
+
+            valence_pref = mood_to_valence_pref(mood)
+            feature_pref_vector = {
+                "danceability": scale_1_5(pref_dance),
+                "energy": scale_1_5(pref_energy),
+                "valence": valence_pref,
+                "tempo": scale_1_5(pref_tempo),
+                "loudness": scale_1_5(pref_loudness),
+                "acousticness": scale_1_5(pref_acoustic),
+            }
+
+            # Tentukan klaster target berdasarkan kombinasi mood + preferensi fitur
+            target_cluster = choose_cluster_by_preferences(
+                feature_pref_vector, cluster_means_norm
+            )
+            target_clusters = [target_cluster]
 
             subset = df[df["cluster"].isin(target_clusters)].copy()
 
@@ -312,12 +458,18 @@ def main():
                 st.error("Tidak ada lagu yang cocok dengan filter tersebut.")
             else:
                 n_rekom = min(n_tracks, len(subset))
-                playlist = subset.sample(n=n_rekom, random_state=None)
+                playlist = build_playlist_from_subset(
+                    subset,
+                    n_rekom,
+                    fav_query=fav_query,
+                )
 
                 st.session_state["playlist"] = playlist
                 st.session_state["chosen_clusters"] = target_clusters
                 st.session_state["user_id"] = user_id.strip()
                 st.session_state["mood"] = mood
+                st.session_state["fav_query"] = fav_query.strip()
+                st.session_state["feature_prefs"] = feature_pref_vector
 
                 st.success("Playlist berhasil dibuat. Gulir ke bawah untuk melihat rekomendasi 👇")
 
@@ -331,13 +483,26 @@ def main():
         st.markdown("<div class='card'>", unsafe_allow_html=True)
 
         deskripsi_klaster = []
-        if cluster_map["happy"] in st.session_state["chosen_clusters"]:
-            deskripsi_klaster.append(f"Klaster {cluster_map['happy']} (cenderung lebih ceria)")
-        if cluster_map["sad"] in st.session_state["chosen_clusters"]:
-            deskripsi_klaster.append(f"Klaster {cluster_map['sad']} (cenderung lebih mellow/sedih)")
+        chosen_clusters = st.session_state.get("chosen_clusters") or []
+        for c in chosen_clusters:
+            label_extra = []
+            if c == cluster_map["happy"]:
+                label_extra.append("cenderung lebih ceria")
+            if c == cluster_map["sad"]:
+                label_extra.append("cenderung lebih mellow/sedih")
+            if label_extra:
+                deskripsi_klaster.append(f"Klaster {c} ({', '.join(label_extra)})")
+            else:
+                deskripsi_klaster.append(f"Klaster {c}")
 
         if deskripsi_klaster:
             st.caption("Klaster yang digunakan: " + "; ".join(deskripsi_klaster))
+
+        if st.session_state.get("fav_query"):
+            st.caption(
+                f"Lagu/artis yang diprioritaskan: **{st.session_state['fav_query']}** "
+                "(jika tersedia di dataset)."
+            )
 
         for _, row in playlist.iterrows():
             col1, col2 = st.columns([3, 1])
