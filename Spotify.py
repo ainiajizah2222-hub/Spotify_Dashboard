@@ -3,10 +3,12 @@
 
 import os
 from datetime import datetime
+from typing import Optional, Tuple, Dict, List
 
 import numpy as np
 import pandas as pd
-import streamlit as st  # langsung import di atas, jangan di dalam main()
+import streamlit as st
+
 
 # -----------------------------
 # KONFIGURASI DASAR
@@ -14,7 +16,6 @@ import streamlit as st  # langsung import di atas, jangan di dalam main()
 DATA_PATH = "top_spotify_clustered.csv"      # ganti jika nama file kamu berbeda
 FEEDBACK_PATH = "feedback_playlist.csv"      # file untuk menyimpan feedback
 
-# Enam fitur audio yang digunakan di penelitian
 FEATURE_COLUMNS = [
     "danceability",
     "energy",
@@ -24,110 +25,241 @@ FEATURE_COLUMNS = [
     "acousticness",
 ]
 
+# Fallback manual (kalau pycountry tidak terpasang / tidak ketemu)
+COUNTRY_NAME_MAP: Dict[str, str] = {
+    "ID": "Indonesia",
+    "US": "Amerika Serikat",
+    "GB": "Inggris",
+    "UK": "Inggris",
+    "AE": "Uni Emirat Arab",
+    "AR": "Argentina",
+    "AT": "Austria",
+    "AU": "Australia",
+    "BE": "Belgia",
+    "BR": "Brasil",
+    "CA": "Kanada",
+    "CH": "Swiss",
+    "CN": "China",
+    "CZ": "Ceko",
+    "DE": "Jerman",
+    "DK": "Denmark",
+    "EG": "Mesir",
+    "ES": "Spanyol",
+    "FI": "Finlandia",
+    "FR": "Prancis",
+    "GR": "Yunani",
+    "HK": "Hong Kong",
+    "HU": "Hungaria",
+    "IE": "Irlandia",
+    "IL": "Israel",
+    "IN": "India",
+    "IT": "Italia",
+    "JP": "Jepang",
+    "KR": "Korea Selatan",
+    "MX": "Meksiko",
+    "MY": "Malaysia",
+    "NL": "Belanda",
+    "NO": "Norwegia",
+    "NZ": "Selandia Baru",
+    "PH": "Filipina",
+    "PL": "Polandia",
+    "PT": "Portugal",
+    "RO": "Rumania",
+    "RU": "Rusia",
+    "SA": "Arab Saudi",
+    "SE": "Swedia",
+    "SG": "Singapura",
+    "TH": "Thailand",
+    "TR": "Turki",
+    "TW": "Taiwan",
+    "UA": "Ukraina",
+    "VN": "Vietnam",
+    "ZA": "Afrika Selatan",
+}
+
 
 # -----------------------------
-# FUNGSI BANTUAN
+# UTIL: COUNTRY (dropdown tanpa kode)
 # -----------------------------
+def _try_pycountry_name(alpha2: str) -> Optional[str]:
+    """Ambil nama negara dari ISO2 via pycountry (opsional). Tidak error kalau pycountry tidak ada."""
+    try:
+        import pycountry  # type: ignore
+        c = pycountry.countries.get(alpha_2=alpha2.upper())
+        return c.name if c else None
+    except Exception:
+        return None
 
+
+def normalize_country_value(x: object) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    return str(x).strip()
+
+
+def looks_like_iso2(code: str) -> bool:
+    return len(code) == 2 and code.isalpha()
+
+
+def country_value_to_display(raw_value: object) -> str:
+    """
+    Untuk DROPDOWN:
+    - ISO2: pycountry -> map -> jika gagal return "" (masuk Lainnya)
+    - non ISO2: tampilkan raw (title case)
+    """
+    raw = normalize_country_value(raw_value)
+    if not raw:
+        return ""
+
+    if looks_like_iso2(raw):
+        code = raw.upper()
+        name_pc = _try_pycountry_name(code)
+        if name_pc:
+            return name_pc
+        name_map = COUNTRY_NAME_MAP.get(code)
+        if name_map:
+            return name_map
+        return ""  # jangan tampilkan kode
+
+    return raw.title() if len(raw) > 2 else raw
+
+
+def build_country_options(df: pd.DataFrame) -> Tuple[List[str], Dict[str, Optional[str]]]:
+    """
+    options: label yang ditampilkan (tanpa kode)
+    mapping: label -> raw_country (untuk filter)
+      - "Lainnya" -> None (filter khusus)
+    """
+    if "country" not in df.columns:
+        return ["Bebas"], {}
+
+    raw_values = (
+        df["country"]
+        .dropna()
+        .map(normalize_country_value)
+        .tolist()
+    )
+    raw_values = sorted({v for v in raw_values if v})
+
+    options: List[str] = ["Bebas"]
+    display_to_raw: Dict[str, Optional[str]] = {}
+
+    used_count: Dict[str, int] = {}
+    unknown_iso2_raw: List[str] = []
+
+    for raw in raw_values:
+        display = country_value_to_display(raw)
+        if display:
+            used_count[display] = used_count.get(display, 0) + 1
+            label = display if used_count[display] == 1 else f"{display} ({used_count[display]})"
+            options.append(label)
+            display_to_raw[label] = raw
+        else:
+            unknown_iso2_raw.append(raw)
+
+    if unknown_iso2_raw:
+        options.append("Lainnya")
+        display_to_raw["Lainnya"] = None
+
+    return options, display_to_raw
+
+
+def country_for_playlist(raw_value: object) -> str:
+    """
+    Untuk TAMPILAN PLAYLIST:
+    - Kalau ISO2 dan dikenal -> tampilkan nama
+    - Kalau ISO2 tidak dikenal -> tampilkan nilai asli (mis. BG) agar tidak kosong
+    - Kalau non ISO2 -> tampilkan raw/titlecase
+    """
+    raw = normalize_country_value(raw_value)
+    if not raw:
+        return ""
+
+    if looks_like_iso2(raw):
+        code = raw.upper()
+        name_pc = _try_pycountry_name(code)
+        if name_pc:
+            return name_pc
+        name_map = COUNTRY_NAME_MAP.get(code)
+        if name_map:
+            return name_map
+        return code  # tampilkan kode jika tidak dikenal (khusus playlist)
+
+    return raw.title() if len(raw) > 2 else raw
+
+
+# -----------------------------
+# FUNGSI BANTUAN (LOGIKA UTAMA)
+# -----------------------------
 @st.cache_data
 def load_data(path: str) -> pd.DataFrame:
-    """Membaca dataset lagu yang sudah diberi label klaster."""
     df = pd.read_csv(path)
 
     if "cluster" not in df.columns:
         raise ValueError("Dataset harus memiliki kolom 'cluster'.")
 
-    # Pastikan enam fitur audio tersedia
     missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
     if missing:
-        raise ValueError(
-            f"Dataset harus memiliki kolom fitur audio berikut: {missing}"
-        )
+        raise ValueError(f"Dataset harus memiliki kolom fitur audio berikut: {missing}")
 
-    # Siapkan kolom link Spotify jika belum ada
+    # Siapkan link Spotify jika belum ada
     if "spotify_url" not in df.columns:
-        # Coba bangun dari track_id atau uri
         if "track_id" in df.columns:
             df["spotify_url"] = "https://open.spotify.com/track/" + df["track_id"].astype(str)
         elif "uri" in df.columns:
-            # format tipikal: spotify:track:<id>
             df["spotify_url"] = df["uri"].astype(str).apply(
                 lambda x: "https://open.spotify.com/track/" + x.split(":")[-1]
             )
         else:
-            df["spotify_url"] = None  # tetap jalan, hanya tanpa link
+            df["spotify_url"] = None
 
     return df
 
 
 def get_cluster_mapping_by_valence(df: pd.DataFrame) -> dict:
-    """
-    Menentukan klaster 'senang' dan 'sedih' berdasarkan rata-rata valence.
-    Klaster dengan valence rata-rata tertinggi -> 'happy'
-    Klaster dengan valence rata-rata terendah -> 'sad'
-    """
     valence_mean = df.groupby("cluster")["valence"].mean().sort_values(ascending=False)
-
-    happy_cluster = int(valence_mean.index[0])       # valence tertinggi
-    sad_cluster = int(valence_mean.index[-1])        # valence terendah
-
+    happy_cluster = int(valence_mean.index[0])
+    sad_cluster = int(valence_mean.index[-1])
     return {"happy": happy_cluster, "sad": sad_cluster}
 
 
 def prepare_cluster_profiles(df: pd.DataFrame):
-    """
-    Menyusun profil rata-rata fitur per klaster dan menormalkan ke skala 0–1
-    agar bisa dibandingkan dengan preferensi pengguna.
-    """
     feature_min = df[FEATURE_COLUMNS].min()
     feature_max = df[FEATURE_COLUMNS].max()
     cluster_means = df.groupby("cluster")[FEATURE_COLUMNS].mean()
 
-    # Normalisasi per fitur ke 0–1
     denom = (feature_max - feature_min).replace(0, 1e-9)
     cluster_means_norm = (cluster_means - feature_min) / denom
-
     return feature_min, feature_max, cluster_means_norm
 
 
 def mood_to_valence_pref(mood: str) -> float:
-    """Memetakan mood ke preferensi valence (0–1)."""
     if mood == "Senang":
         return 0.8
     if mood == "Sedih":
         return 0.2
-    return 0.5  # Netral
+    return 0.5
 
 
 def choose_cluster_by_preferences(pref_vector: dict, cluster_means_norm: pd.DataFrame) -> int:
-    """
-    Menentukan klaster yang paling dekat dengan preferensi pengguna
-    berdasarkan jarak Euclidean pada fitur yang sudah dinormalisasi.
-    """
     user_vec = np.array([pref_vector[c] for c in FEATURE_COLUMNS])
 
     best_cluster = None
     best_dist = None
     for cluster_label, row in cluster_means_norm.iterrows():
-        cluster_vec = row.to_numpy()
-        dist = np.linalg.norm(user_vec - cluster_vec)
+        dist = np.linalg.norm(user_vec - row.to_numpy())
         if best_dist is None or dist < best_dist:
             best_dist = dist
             best_cluster = int(cluster_label)
 
-    return best_cluster
+    return int(best_cluster)
 
 
 def build_playlist_from_subset(
     subset: pd.DataFrame,
     n_tracks: int,
-    fav_query: str | None = None,
+    fav_query: Optional[str] = None,
 ) -> pd.DataFrame:
-    """
-    Menyusun playlist dari subset lagu:
-    - Diacak dulu
-    - Jika ada judul/artis favorit, lagu yang match diprioritaskan muncul di urutan atas.
-    """
     subset_shuffled = subset.sample(frac=1.0, random_state=None)
 
     if fav_query:
@@ -143,29 +275,20 @@ def build_playlist_from_subset(
 
             fav_df = subset_shuffled[mask]
             other_df = subset_shuffled[~mask]
+            return pd.concat([fav_df.head(3), other_df]).head(n_tracks)
 
-            # Maksimal 3 lagu prioritas, lalu sisanya acak
-            playlist = pd.concat([fav_df.head(3), other_df]).head(n_tracks)
-            return playlist
-
-    # Jika tidak ada preferensi, atau tidak ada yang match
     return subset_shuffled.head(n_tracks)
 
 
 def save_feedback(row: dict, feedback_path: str = FEEDBACK_PATH) -> None:
-    """Menyimpan 1 baris feedback ke file CSV (append)."""
     df_row = pd.DataFrame([row])
-
     if os.path.exists(feedback_path):
-        # Tambah ke bawah, tanpa header
         df_row.to_csv(feedback_path, mode="a", header=False, index=False, encoding="utf-8")
     else:
-        # Buat file baru dengan header
         df_row.to_csv(feedback_path, mode="w", header=True, index=False, encoding="utf-8")
 
 
 def init_session_state():
-    """Inisialisasi variabel di session_state."""
     defaults = {
         "playlist": None,
         "chosen_clusters": None,
@@ -182,7 +305,6 @@ def init_session_state():
 # -----------------------------
 # MAIN APP
 # -----------------------------
-
 def main():
     st.set_page_config(
         page_title="Personalisasi Playlist Musik",
@@ -190,100 +312,105 @@ def main():
         layout="wide",
     )
 
-    # ---------- TEMA & CSS KUSTOM ----------
+    # ---------- CSS (RESPONSIF + KONTRAS + FORM CARD) ----------
     st.markdown(
         """
         <style>
-        :root {
-            --primary: #6366f1;   /* ungu */
-            --primary-soft: #eef2ff;
-            --border-soft: #e5e7eb;
-            --text-muted: #6b7280;
+        :root{
+            --primary:#6366f1;
+            --primary2:#4f46e5;
+            --primary3:#a855f7;
+            --border:#e5e7eb;
+            --muted:#6b7280;
+            --text:#111827;
+            --bg:#ffffff;
         }
 
-        .stApp {
+        .stApp{
             background: radial-gradient(circle at top, #eef2ff 0, #f9fafb 40%, #ffffff 100%);
         }
-        .block-container {
-            padding-top: 2.5rem;
-            padding-bottom: 2rem;
+
+        .block-container{
+            padding-top: 2.0rem;
+            padding-bottom: 2.0rem;
             max-width: 980px;
         }
 
-        /* header besar */
-        .header-card {
-            display: flex;
-            align-items: center;
-            gap: 1.2rem;
-            padding: 1.3rem 1.6rem;
-            border-radius: 22px;
-            background: linear-gradient(135deg, #4f46e5, #6366f1, #a855f7);
-            color: #f9fafb;
-            box-shadow: 0 16px 40px rgba(15,23,42,0.35);
+        /* Anti kontras rendah di HP */
+        .stApp, .stMarkdown, .stMarkdown p, .stMarkdown span, label, p, li, div{
+            color: var(--text) !important;
+        }
+
+        .header-card{
+            display:flex;
+            align-items:center;
+            gap:1.2rem;
+            padding:1.2rem 1.4rem;
+            border-radius:22px;
+            background: linear-gradient(135deg, var(--primary2), var(--primary), var(--primary3));
+            color:#f9fafb !important;
+            box-shadow: 0 10px 24px rgba(15,23,42,0.18);
             margin-bottom: 1.6rem;
         }
-        .header-icon {
-            font-size: 2.4rem;
-        }
-        .header-title {
-            font-size: 1.5rem;
-            font-weight: 700;
-            margin-bottom: 0.25rem;
-        }
-        .header-subtitle {
-            font-size: 0.93rem;
-            color: #e5e7eb;
-            margin: 0;
-        }
+        .header-card *{ color:#f9fafb !important; }
+        .header-icon{ font-size:2.4rem; }
+        .header-title{ font-size:1.5rem; font-weight:700; margin-bottom:0.25rem; }
+        .header-subtitle{ font-size:0.93rem; color:#e5e7eb !important; margin:0; }
 
-        /* card putih */
-        .card {
-            background-color: #ffffff;
-            border-radius: 18px;
-            padding: 1.2rem 1.4rem;
-            border: 1px solid var(--border-soft);
-            box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
-            margin-bottom: 1.2rem;
-        }
-
-        /* judul section */
-        .section-title {
-            font-size: 1.05rem;
-            font-weight: 600;
-            margin-bottom: 0.4rem;
-        }
-
-        /* tombol */
-        .stButton>button {
-            border-radius: 999px;
-            border: 1px solid transparent;
-            background: var(--primary);
-            color: #ffffff;
-            padding: 0.45rem 1.5rem;
-            font-weight: 500;
-            box-shadow: 0 4px 10px rgba(99,102,241,0.35);
-        }
-        .stButton>button:hover {
-            background: #4f46e5;
-        }
-
-        /* slider + label lebih rapih */
-        .stSlider label {
-            font-size: 0.9rem;
-            color: #374151;
-        }
-
-        /* teks kecil */
-        .small-caption {
-            font-size: 0.8rem;
-            color: var(--text-muted);
-        }
-
-        /* garis pemisah halus antar lagu */
-        .song-divider {
-            height: 1px;
-            background: linear-gradient(to right, #e5e7eb, #c7d2fe, #e5e7eb);
+        .section-title{
+            font-size:1.05rem;
+            font-weight:700;
             margin: 0.4rem 0 0.6rem 0;
+        }
+        .small-caption{
+            font-size:0.82rem;
+            color: var(--muted) !important;
+        }
+
+        .stButton>button{
+            border-radius:999px;
+            border:1px solid transparent;
+            background: var(--primary);
+            color:#ffffff !important;
+            padding:0.5rem 1.5rem;
+            font-weight:600;
+            box-shadow:0 4px 10px rgba(99,102,241,0.35);
+        }
+        .stButton>button:hover{ background: var(--primary2); }
+
+        /* FIX: Form jadi card */
+        [data-testid="stForm"]{
+            background: var(--bg) !important;
+            border-radius: 18px !important;
+            padding: 1.2rem 1.4rem !important;
+            border: 1px solid var(--border) !important;
+            box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06) !important;
+        }
+
+        [data-testid="stTextInput"] input,
+        [data-testid="stTextArea"] textarea,
+        [data-testid="stSelectbox"] div[role="combobox"],
+        [data-testid="stNumberInput"] input{
+            background: #ffffff !important;
+            color: var(--text) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 12px !important;
+        }
+
+        .stSlider label{ font-size:0.92rem; color: var(--text) !important; }
+
+        /* divider lebih halus */
+        hr{
+            border: none;
+            border-top: 1px solid #e5e7eb;
+            margin: 1rem 0;
+        }
+
+        @media (max-width: 768px){
+            .block-container{ padding-top:1.25rem; padding-left:1rem; padding-right:1rem; }
+            .header-card{ flex-direction:column; align-items:flex-start; padding:1rem; }
+            .header-title{ font-size:1.25rem; }
+            .header-subtitle{ font-size:0.9rem; }
         }
         </style>
         """,
@@ -306,7 +433,6 @@ def main():
         )
         st.markdown("---")
 
-        # info singkat feedback
         if os.path.exists(FEEDBACK_PATH):
             try:
                 fb = pd.read_csv(FEEDBACK_PATH)
@@ -341,24 +467,15 @@ def main():
         return
 
     init_session_state()
-
-    # Siapkan profil klaster untuk pemetaan preferensi -> klaster
     _, _, cluster_means_norm = prepare_cluster_profiles(df)
-
-    # Siapkan daftar negara (jika ada)
-    if "country" in df.columns:
-        country_options = ["Bebas"] + sorted(df["country"].dropna().unique().tolist())
-    else:
-        country_options = ["Bebas"]
-
-    # Pemetaan klaster happy/sad berdasar valence (untuk deskripsi saja)
     cluster_map = get_cluster_mapping_by_valence(df)
+
+    country_options, display_to_raw_country = build_country_options(df)
 
     # -------------------------
     # 1. FORM PREFERENSI
     # -------------------------
     st.markdown("<div class='section-title'>1. Isi Preferensi Kamu</div>", unsafe_allow_html=True)
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
 
     with st.form("pref_form"):
         user_id = st.text_input("Nama / ID responden", "")
@@ -367,7 +484,7 @@ def main():
             "Mood kamu sekarang?",
             ["Senang", "Netral", "Sedih"],
             index=0,
-            horizontal=True,
+            horizontal=False,
         )
 
         col_form1, col_form2 = st.columns(2)
@@ -423,46 +540,43 @@ def main():
 
         submitted_pref = st.form_submit_button("🎵 Buat Playlist")
 
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # Proses saat tombol "Buat Playlist" ditekan
     if submitted_pref:
         if not user_id.strip():
             st.warning("Mohon isi Nama / ID responden terlebih dahulu.")
         else:
-            # Bangun vektor preferensi fitur audio (skala 0–1)
             scale_1_5 = lambda x: (x - 1) / 4.0
 
-            valence_pref = mood_to_valence_pref(mood)
             feature_pref_vector = {
                 "danceability": scale_1_5(pref_dance),
                 "energy": scale_1_5(pref_energy),
-                "valence": valence_pref,
+                "valence": mood_to_valence_pref(mood),
                 "tempo": scale_1_5(pref_tempo),
                 "loudness": scale_1_5(pref_loudness),
                 "acousticness": scale_1_5(pref_acoustic),
             }
 
-            # Tentukan klaster target berdasarkan kombinasi mood + preferensi fitur
-            target_cluster = choose_cluster_by_preferences(
-                feature_pref_vector, cluster_means_norm
-            )
+            target_cluster = choose_cluster_by_preferences(feature_pref_vector, cluster_means_norm)
             target_clusters = [target_cluster]
-
             subset = df[df["cluster"].isin(target_clusters)].copy()
 
+            # Filter negara (dropdown tanpa kode)
             if country_pref != "Bebas" and "country" in df.columns:
-                subset = subset[subset["country"] == country_pref]
+                raw_selected = display_to_raw_country.get(country_pref)
+
+                if raw_selected is None:
+                    # "Lainnya" = ISO2 yang tidak dikenal namanya (untuk dropdown)
+                    def is_unknown_iso2(v: object) -> bool:
+                        raw = normalize_country_value(v)
+                        return looks_like_iso2(raw) and (country_value_to_display(raw) == "")
+                    subset = subset[subset["country"].apply(is_unknown_iso2)]
+                elif raw_selected:
+                    subset = subset[subset["country"].map(normalize_country_value) == raw_selected]
 
             if subset.empty:
                 st.error("Tidak ada lagu yang cocok dengan filter tersebut.")
             else:
                 n_rekom = min(n_tracks, len(subset))
-                playlist = build_playlist_from_subset(
-                    subset,
-                    n_rekom,
-                    fav_query=fav_query,
-                )
+                playlist = build_playlist_from_subset(subset, n_rekom, fav_query=fav_query)
 
                 st.session_state["playlist"] = playlist
                 st.session_state["chosen_clusters"] = target_clusters
@@ -474,14 +588,14 @@ def main():
                 st.success("Playlist berhasil dibuat. Gulir ke bawah untuk melihat rekomendasi 👇")
 
     # -------------------------
-    # 2. TAMPILKAN PLAYLIST
+    # 2. TAMPILKAN PLAYLIST (MODEL SEPERTI SCREENSHOT KAMU)
     # -------------------------
     if st.session_state["playlist"] is not None:
         playlist = st.session_state["playlist"]
 
         st.markdown("<div class='section-title'>2. Playlist Rekomendasi untuk Kamu</div>", unsafe_allow_html=True)
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
 
+        # Deskripsi klaster
         deskripsi_klaster = []
         chosen_clusters = st.session_state.get("chosen_clusters") or []
         for c in chosen_clusters:
@@ -504,37 +618,45 @@ def main():
                 "(jika tersedia di dataset)."
             )
 
+        # List lagu: kiri judul, kanan link, bawah negara, divider
         for _, row in playlist.iterrows():
-            col1, col2 = st.columns([3, 1])
+            title = str(row.get("track_name", "Tanpa judul"))
+            artist = str(row.get("track_artist", "Tanpa artis"))
 
+            year = row.get("year", "")
+            year_str = ""
+            try:
+                if pd.notna(year) and str(year).strip() != "":
+                    year_str = f" ({int(year)})"
+            except Exception:
+                year_str = ""
+
+            spotify_url = row.get("spotify_url", None)
+            spotify_url = spotify_url if isinstance(spotify_url, str) else ""
+
+            country_disp = country_for_playlist(row.get("country", None))
+
+            col1, col2 = st.columns([6, 2], vertical_alignment="center")
             with col1:
-                title = str(row.get("track_name", "Tanpa judul"))
-                artist = str(row.get("track_artist", "Tanpa artis"))
-                year = row.get("year", "")
-                year_str = f" ({int(year)})" if pd.notna(year) else ""
-
-                st.markdown(f"**{title}** — {artist}{year_str}")
-
-                country = row.get("country", None)
-                if pd.notna(country):
-                    st.caption(f"Negara: {country}")
-
+                st.markdown(f"**{title} — {artist}{year_str}**")
             with col2:
-                spotify_url = row.get("spotify_url", None)
-                if pd.notna(spotify_url) and isinstance(spotify_url, str):
-                    st.markdown(f"[Buka di Spotify]({spotify_url})")
+                if spotify_url and spotify_url.strip():
+                    st.markdown(
+                        f"<div style='text-align:right;'><a href='{spotify_url}' target='_blank' rel='noopener'>Buka di Spotify</a></div>",
+                        unsafe_allow_html=True,
+                    )
                 else:
-                    st.write("Link Spotify\n tidak tersedia")
+                    st.markdown("<div style='text-align:right; color:#6b7280;'>Link tidak tersedia</div>", unsafe_allow_html=True)
 
-            st.markdown("<div class='song-divider'></div>", unsafe_allow_html=True)
+            if country_disp:
+                st.caption(f"Negara: {country_disp}")
 
-        st.markdown("</div>", unsafe_allow_html=True)
+            st.divider()
 
         # -------------------------
         # 3. FORM FEEDBACK
         # -------------------------
         st.markdown("<div class='section-title'>3. Berikan Feedback Setelah Mendengarkan</div>", unsafe_allow_html=True)
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
 
         with st.form("feedback_form"):
             rating = st.slider(
@@ -550,14 +672,14 @@ def main():
             submitted_feedback = st.form_submit_button("✅ Kirim Feedback")
 
         if submitted_feedback:
-            playlist = st.session_state["playlist"]
+            playlist_df = st.session_state["playlist"]
 
-            if "track_id" in playlist.columns:
-                track_ids = playlist["track_id"].astype(str).tolist()
-            elif "spotify_url" in playlist.columns:
-                track_ids = playlist["spotify_url"].astype(str).tolist()
-            elif "track_name" in playlist.columns:
-                track_ids = playlist["track_name"].astype(str).tolist()
+            if "track_id" in playlist_df.columns:
+                track_ids = playlist_df["track_id"].astype(str).tolist()
+            elif "spotify_url" in playlist_df.columns:
+                track_ids = playlist_df["spotify_url"].astype(str).tolist()
+            elif "track_name" in playlist_df.columns:
+                track_ids = playlist_df["track_name"].astype(str).tolist()
             else:
                 track_ids = []
 
@@ -574,9 +696,6 @@ def main():
             save_feedback(feedback_row)
             st.success("Terima kasih, feedback kamu sudah tersimpan 🙌")
 
-        st.markdown("</div>", unsafe_allow_html=True)
-
 
 if __name__ == "__main__":
-    # jalankan dengan: streamlit run app.py
     main()
