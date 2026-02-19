@@ -1,0 +1,6 @@
+﻿streamlit
+pandas
+numpy
+pycountry
+gspread
+google-auth
