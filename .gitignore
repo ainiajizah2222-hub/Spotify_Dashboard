@@ -1,0 +1,15 @@
+# Virtual environment
+.venv/
+
+# Streamlit secrets (jangan pernah diupload)
+.streamlit/secrets.toml
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local feedback files
+feedback_playlist.csv
+feedback_playlist.jsonl
+feedback_playlist*.csv
+feedback_playlist*.jsonl
