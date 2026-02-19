@@ -2,6 +2,9 @@
 # Streamlit: Personalisasi Playlist Musik berdasarkan Klaster Spotify
 
 import os
+import json
+import re
+from pathlib import Path
 from datetime import datetime
 from typing import Optional, Tuple, Dict, List
 
@@ -9,12 +12,18 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# untuk simpan ke Google Sheets (deploy)
+import gspread
+from google.oauth2.service_account import Credentials
+
 
 # -----------------------------
 # KONFIGURASI DASAR
 # -----------------------------
-DATA_PATH = "top_spotify_clustered.csv"      # ganti jika nama file kamu berbeda
-FEEDBACK_PATH = "feedback_playlist.csv"      # file untuk menyimpan feedback
+BASE_DIR = Path(__file__).resolve().parent
+
+DATA_PATH = str(BASE_DIR / "top_spotify_clustered.csv")          # aman, tidak nyasar folder
+FEEDBACK_JSONL_PATH = str(BASE_DIR / "feedback_playlist.jsonl")  # feedback format JSONL
 
 FEATURE_COLUMNS = [
     "danceability",
@@ -280,12 +289,91 @@ def build_playlist_from_subset(
     return subset_shuffled.head(n_tracks)
 
 
-def save_feedback(row: dict, feedback_path: str = FEEDBACK_PATH) -> None:
-    df_row = pd.DataFrame([row])
-    if os.path.exists(feedback_path):
-        df_row.to_csv(feedback_path, mode="a", header=False, index=False, encoding="utf-8")
-    else:
-        df_row.to_csv(feedback_path, mode="w", header=True, index=False, encoding="utf-8")
+# -----------------------------
+# FEEDBACK (DIPERBAIKI KHUSUS BAGIAN INI)
+# -----------------------------
+def sanitize_comment(text: str, max_len: int = 500) -> str:
+    if text is None:
+        return ""
+    t = str(text)
+
+    # buang karakter kontrol aneh, rapikan spasi
+    t = "".join(ch for ch in t if ch.isprintable() or ch in "\n\t")
+    t = t.replace("\t", " ").replace("\n", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # batasi panjang
+    if len(t) > max_len:
+        t = t[:max_len].rstrip()
+
+    return t
+
+
+def validate_comment_if_filled(raw_text: str) -> str:
+    clean = sanitize_comment(raw_text)
+
+    # user ngetik tapi hasilnya kosong
+    if raw_text and not clean:
+        raise ValueError("Komentar terdeteksi kosong. Tulis komentar singkat yang jelas atau biarkan kosong.")
+
+    # kalau komentar diisi, wajib ada huruf (bukan angka/simbol doang)
+    if clean:
+        has_letter = any(ch.isalpha() for ch in clean)
+        if not has_letter:
+            raise ValueError("Komentar harus mengandung huruf (bukan hanya angka/simbol). Contoh: 'lagunya terlalu upbeat'.")
+        if len(clean) < 3:
+            raise ValueError("Komentar terlalu pendek. Tambahkan sedikit supaya jelas ya.")
+
+    return clean
+
+
+def save_feedback_jsonl_local(row: dict, path: str = FEEDBACK_JSONL_PATH) -> None:
+    line = json.dumps(row, ensure_ascii=False) + "\n"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def save_feedback_to_google_sheet(row: dict) -> None:
+    # butuh st.secrets saat deploy
+    sheet_id = st.secrets["gspread"]["sheet_id"]
+
+    creds_info = dict(st.secrets["gcp_service_account"])
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+
+    client = gspread.authorize(creds)
+    sh = client.open_by_key(sheet_id)
+    ws = sh.sheet1
+
+    payload_json = json.dumps(row, ensure_ascii=False)
+
+    ws.append_row(
+        [
+            row.get("timestamp", ""),
+            row.get("user_id", ""),
+            row.get("mood", ""),
+            row.get("chosen_clusters", ""),
+            row.get("rating", ""),
+            row.get("comment", ""),
+            row.get("tracks", ""),
+            payload_json,
+        ],
+        value_input_option="RAW",
+    )
+
+
+def save_feedback_final(row: dict) -> None:
+    # selalu simpan local (bertambah)
+    save_feedback_jsonl_local(row)
+
+    # simpan ke Google Sheet kalau secrets tersedia (deploy publik)
+    try:
+        save_feedback_to_google_sheet(row)
+    except Exception:
+        # local tanpa secrets tetap aman, tidak bikin app error
+        pass
 
 
 def init_session_state():
@@ -433,12 +521,14 @@ def main():
         )
         st.markdown("---")
 
-        if os.path.exists(FEEDBACK_PATH):
+        # FEEDBACK COUNT (JSONL)
+        if os.path.exists(FEEDBACK_JSONL_PATH):
             try:
-                fb = pd.read_csv(FEEDBACK_PATH)
-                st.metric("Total feedback", len(fb))
+                with open(FEEDBACK_JSONL_PATH, "r", encoding="utf-8") as f:
+                    total = sum(1 for line in f if line.strip())
+                st.metric("Total feedback", total)
             except Exception:
-                st.caption("Feedback tersimpan di `feedback_playlist.csv`.")
+                st.caption("Feedback tersimpan di `feedback_playlist.jsonl`.")
         else:
             st.caption("Belum ada feedback yang tersimpan.")
 
@@ -588,7 +678,7 @@ def main():
                 st.success("Playlist berhasil dibuat. Gulir ke bawah untuk melihat rekomendasi 👇")
 
     # -------------------------
-    # 2. TAMPILKAN PLAYLIST (MODEL SEPERTI SCREENSHOT KAMU)
+    # 2. TAMPILKAN PLAYLIST
     # -------------------------
     if st.session_state["playlist"] is not None:
         playlist = st.session_state["playlist"]
@@ -618,7 +708,7 @@ def main():
                 "(jika tersedia di dataset)."
             )
 
-        # List lagu: kiri judul, kanan link, bawah negara, divider
+        # List lagu
         for _, row in playlist.iterrows():
             title = str(row.get("track_name", "Tanpa judul"))
             artist = str(row.get("track_artist", "Tanpa artis"))
@@ -654,7 +744,7 @@ def main():
             st.divider()
 
         # -------------------------
-        # 3. FORM FEEDBACK
+        # 3. FORM FEEDBACK (DIPERBAIKI)
         # -------------------------
         st.markdown("<div class='section-title'>3. Berikan Feedback Setelah Mendengarkan</div>", unsafe_allow_html=True)
 
@@ -672,6 +762,13 @@ def main():
             submitted_feedback = st.form_submit_button("✅ Kirim Feedback")
 
         if submitted_feedback:
+            # validasi komentar (anti blank / anti angka-simbol)
+            try:
+                clean_comment = validate_comment_if_filled(comment)
+            except ValueError as e:
+                st.warning(str(e))
+                st.stop()
+
             playlist_df = st.session_state["playlist"]
 
             if "track_id" in playlist_df.columns:
@@ -689,12 +786,13 @@ def main():
                 "mood": st.session_state["mood"],
                 "chosen_clusters": ",".join(map(str, st.session_state["chosen_clusters"])),
                 "rating": rating,
-                "comment": comment,
+                "comment": clean_comment,
                 "tracks": ";".join(track_ids),
             }
 
-            save_feedback(feedback_row)
+            save_feedback_final(feedback_row)
             st.success("Terima kasih, feedback kamu sudah tersimpan 🙌")
+            st.rerun()
 
 
 if __name__ == "__main__":
