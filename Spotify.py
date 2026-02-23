@@ -791,8 +791,7 @@ def main():
             }
 
             save_feedback_final(feedback_row)
-            st.success("Terima kasih, feedback kamu sudah tersimpan 🙌")
-            st.rerun()
+            st.toast("✅ Feedback kamu sudah tersimpan 🙌", icon="✅")
 
 
 if __name__ == "__main__":
