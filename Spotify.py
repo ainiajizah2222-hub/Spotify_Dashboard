@@ -744,63 +744,55 @@ def main():
             st.divider()
 
         # -------------------------
-# 3. FORM FEEDBACK (SIAP TEMPEL: notif muncul + form ke-reset)
-# -------------------------
-st.markdown("<div class='section-title'>3. Berikan Feedback Setelah Mendengarkan</div>", unsafe_allow_html=True)
+        # 3. FORM FEEDBACK (DIPERBAIKI)
+        # -------------------------
+        st.markdown("<div class='section-title'>3. Berikan Feedback Setelah Mendengarkan</div>", unsafe_allow_html=True)
 
-# ✅ Tampilkan notif setelah rerun (popup-like)
-if st.session_state.get("feedback_saved", False):
-    st.toast("✅ Feedback kamu sudah tersimpan 🙌", icon="✅")  # notif kecil seperti pop-up
-    st.success("Terima kasih, feedback kamu sudah tersimpan 🙌")  # banner (boleh hapus kalau mau toast saja)
-    st.session_state["feedback_saved"] = False  # reset agar tidak muncul terus
+        with st.form("feedback_form"):
+            rating = st.slider(
+                "Seberapa cocok playlist ini dengan selera kamu?",
+                min_value=1,
+                max_value=5,
+                value=4,
+            )
+            comment = st.text_area(
+                "Komentar tambahan (opsional)\n"
+                "(misalnya: lagu terlalu upbeat, kurang lagu mellow, dsb.)"
+            )
+            submitted_feedback = st.form_submit_button("✅ Kirim Feedback")
 
-with st.form("feedback_form"):
-    rating = st.slider(
-        "Seberapa cocok playlist ini dengan selera kamu?",
-        min_value=1,
-        max_value=5,
-        value=4,
-    )
-    comment = st.text_area(
-        "Komentar tambahan (opsional)\n"
-        "(misalnya: lagu terlalu upbeat, kurang lagu mellow, dsb.)"
-    )
-    submitted_feedback = st.form_submit_button("✅ Kirim Feedback")
+        if submitted_feedback:
+            # validasi komentar (anti blank / anti angka-simbol)
+            try:
+                clean_comment = validate_comment_if_filled(comment)
+            except ValueError as e:
+                st.warning(str(e))
+                st.stop()
 
-if submitted_feedback:
-    # validasi komentar (anti blank / anti angka-simbol)
-    try:
-        clean_comment = validate_comment_if_filled(comment)
-    except ValueError as e:
-        st.warning(str(e))
-        st.stop()
+            playlist_df = st.session_state["playlist"]
 
-    playlist_df = st.session_state["playlist"]
+            if "track_id" in playlist_df.columns:
+                track_ids = playlist_df["track_id"].astype(str).tolist()
+            elif "spotify_url" in playlist_df.columns:
+                track_ids = playlist_df["spotify_url"].astype(str).tolist()
+            elif "track_name" in playlist_df.columns:
+                track_ids = playlist_df["track_name"].astype(str).tolist()
+            else:
+                track_ids = []
 
-    if "track_id" in playlist_df.columns:
-        track_ids = playlist_df["track_id"].astype(str).tolist()
-    elif "spotify_url" in playlist_df.columns:
-        track_ids = playlist_df["spotify_url"].astype(str).tolist()
-    elif "track_name" in playlist_df.columns:
-        track_ids = playlist_df["track_name"].astype(str).tolist()
-    else:
-        track_ids = []
+            feedback_row = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "user_id": st.session_state["user_id"],
+                "mood": st.session_state["mood"],
+                "chosen_clusters": ",".join(map(str, st.session_state["chosen_clusters"])),
+                "rating": rating,
+                "comment": clean_comment,
+                "tracks": ";".join(track_ids),
+            }
 
-    feedback_row = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "user_id": st.session_state["user_id"],
-        "mood": st.session_state["mood"],
-        "chosen_clusters": ",".join(map(str, st.session_state["chosen_clusters"])),
-        "rating": rating,
-        "comment": clean_comment,
-        "tracks": ";".join(track_ids),
-    }
-
-    save_feedback_final(feedback_row)
-
-    # ✅ set flag dulu, lalu rerun -> form reset + notif muncul setelah reload
-    st.session_state["feedback_saved"] = True
-    st.rerun()
+            save_feedback_final(feedback_row)
+            st.success("Terima kasih, feedback kamu sudah tersimpan 🙌")
+            st.rerun()
 
 
 if __name__ == "__main__":
